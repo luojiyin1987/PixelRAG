@@ -33,6 +33,7 @@ Usage:
 
 import argparse
 import base64
+import contextvars
 import functools
 import io
 import json
@@ -40,19 +41,52 @@ import logging
 import os
 import re
 import time
+import uuid
 from datetime import datetime, timezone
 
 import faiss
 import numpy as np
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from PIL import Image
 from pydantic import BaseModel
 
+_request_id_ctx: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "request_id",
+    default="-",
+)
+"""Per-request tracing ID, propagated across async context switches."""
+
+
+def _sanitize_request_id(raw: str) -> str | None:
+    """Return *raw* if it looks safe (≤64 chars, alphanumeric + ``-_``), else None."""
+    if len(raw) > 64:
+        return None
+    if raw.replace("-", "").replace("_", "").isalnum():
+        return raw.strip()
+    return None
+
+
+class _RequestIDFilter(logging.Filter):
+    """Logging filter that injects the current request ID into every record.
+
+    Registered on the root logger so that third-party loggers (uvicorn,
+    httpx, …) also see a ``[-]`` placeholder instead of crashing on
+    ``%(req)s`` in the format string.
+    """
+
+    def filter(self, record):
+        record.req = _request_id_ctx.get()
+        return True
+
+
+logging.getLogger().addFilter(_RequestIDFilter())
+
 logger = logging.getLogger("search_api")
 logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: [%(req)s] %(message)s",
 )
 
 app = FastAPI(title="PixelRAG Search API")
@@ -64,6 +98,31 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def _request_id_middleware(request: Request, call_next):
+    """Inject a per-request tracing ID into logs and the response header.
+
+    Reads ``X-Request-ID`` from the incoming request (sanitised), or
+    generates a fresh 16-hex-char ID.  The ID is stored in a
+    :class:`contextvars.ContextVar` so it flows through ``await``
+    boundaries and is picked up by :class:`_RequestIDFilter`.
+    The *response* always carries ``X-Request-ID`` so callers can
+    correlate client-side and server-side traces.
+    """
+    incoming = request.headers.get("X-Request-ID")
+    # A malformed incoming ID sanitises to None — fall back to a fresh ID
+    # rather than letting None reach the ContextVar / response header.
+    req_id = (incoming and _sanitize_request_id(incoming)) or uuid.uuid4().hex[:16]
+    token = _request_id_ctx.set(req_id)
+    try:
+        response: Response = await call_next(request)
+        response.headers["X-Request-ID"] = req_id
+        return response
+    finally:
+        _request_id_ctx.reset(token)
+
 
 # Global state loaded at startup
 _state = {}
